@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Big 2</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#166534;font-family:Arial,sans-serif;color:#fff;min-height:100vh}
+  button{cursor:pointer;border:none;font-family:inherit}
+  button:disabled{cursor:not-allowed}
+  input{font-family:inherit}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script type="text/babel">
+const {useState,useEffect,useRef} = React;
+
+const FB = 'https://big-2-a06dc-default-rtdb.asia-southeast1.firebasedatabase.app';
+const SS = ['♦','♣','♥','♠'];
+const SC = ['#dc2626','#111827','#dc2626','#111827'];
+const VL = ['3','4','5','6','7','8','9','10','J','Q','K','A','2'];
+const FT = new Set(['straight','flush','full-house','straight-flush','royal-flush']);
+const TR = {single:0,pair:1,triple:2,quad:3,straight:4,flush:5,'full-house':6,'straight-flush':7,'royal-flush':8};
+const G='#166534', DG='rgba(0,0,0,0.22)', GOLD='#fbbf24';
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+const num  = v => typeof v === 'string' ? parseInt(v,10) : (typeof v === 'number' ? v : 0);
+const cr   = c => c.v*4+c.s;
+const sk   = c => c.v*4+c.s;
+const srt  = cs => [...cs].sort((a,b)=>cr(a)-cr(b));
+const cStr = c => `${VL[c.v]}${SS[c.s]}`;
+const genId= () => Math.random().toString(36).substr(2,9);
+const genCode=()=>{const ch='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';return Array.from({length:4},()=>ch[Math.floor(Math.random()*ch.length)]).join('');};
+
+// Normalise a single card's fields to numbers
+function normCard(c) { return c ? {v:num(c.v), s:num(c.s)} : null; }
+
+// Convert Firebase object/array to plain array
+function toArr(v, fallback=[]) {
+  if (v == null) return fallback;
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'object') return Object.keys(v).sort((a,b)=>+a-+b).map(k=>v[k]);
+  return fallback;
+}
+
+// Normalise state from Firebase — coerce all numbers, fix arrays
+function normState(s, n) {
+  if (!s) return null;
+  const passed    = toArr(s.passed,    Array(n).fill(false));
+  const handSizes = toArr(s.handSizes, Array(n).fill(13));
+  const log       = toArr(s.log,       []);
+  const cur = s.cur
+    ? {type: s.cur.type, cards: toArr(s.cur.cards).map(normCard)}
+    : null;
+  return {
+    ...s,
+    turn:     num(s.turn),
+    lastBy:   num(s.lastBy),
+    roundNum: num(s.roundNum),
+    winner:   s.winner != null ? num(s.winner) : null,
+    must:     s.must ? normCard(s.must) : null,
+    passed, handSizes, log, cur,
+  };
+}
+
+// ── Firebase ─────────────────────────────────────────────────────────────────
+async function fbRead(path) {
+  const r = await fetch(`${FB}${path}.json`);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+async function fbSet(path, data) {
+  const r = await fetch(`${FB}${path}.json`, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+}
+async function fbPatch(path, data) {
+  const r = await fetch(`${FB}${path}.json`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+}
+
+// ── Card logic ────────────────────────────────────────────────────────────────
+function mkDeck() {
+  const d=[];for(let v=0;v<13;v++)for(let s=0;s<4;s++)d.push({v,s});
+  for(let i=d.length-1;i>0;i--){const j=0|Math.random()*(i+1);[d[i],d[j]]=[d[j],d[i]];}
+  return d;
+}
+function detect(cards) {
+  if (!cards?.length) return null;
+  const c=srt(cards), n=c.length, vs=c.map(x=>x.v), ss=c.map(x=>x.s);
+  if (n===1) return {type:'single',cards:c};
+  if (n===2) return vs[0]===vs[1] ? {type:'pair',cards:c} : null;
+  if (n===3) return vs.every(v=>v===vs[0]) ? {type:'triple',cards:c} : null;
+  if (n===4) return vs.every(v=>v===vs[0]) ? {type:'quad',cards:c} : null;
+  if (n===5) {
+    const fl=ss.every(s=>s===ss[0]), st=vs.every((v,i)=>!i||v===vs[i-1]+1);
+    const vc={}; vs.forEach(v=>vc[v]=(vc[v]||0)+1);
+    const cn=Object.values(vc).sort((a,b)=>b-a);
+    if (st&&fl) return {type: vs[0]===7&&vs[4]===11 ? 'royal-flush' : 'straight-flush', cards:c};
+    if (cn[0]===3&&cn[1]===2) return {type:'full-house',cards:c};
+    if (fl) return {type:'flush',cards:c};
+    if (st) return {type:'straight',cards:c};
+    return null;
+  }
+  return null;
+}
+function beats(cur,chl) {
+  if (!chl) return false; if (!cur) return true;
+  const {type:ct,cards:cc}=cur, {type:ht,cards:hc}=chl;
+  if (FT.has(ct)&&FT.has(ht)) {
+    if (TR[ht]!==TR[ct]) return TR[ht]>TR[ct];
+    if (ct==='full-house') {const tv=xs=>{const x={};xs.forEach(c=>x[c.v]=(x[c.v]||0)+1);return+Object.keys(x).find(k=>x[k]===3);};return tv(hc)>tv(cc);}
+    if (ct==='royal-flush') return hc[0].s>cc[0].s;
+    return cr(hc[4])>cr(cc[4]);
+  }
+  if (ct!==ht) return false;
+  if (ct==='single') return cr(hc[0])>cr(cc[0]);
+  if (ct==='pair') return hc[1].v!==cc[1].v ? hc[1].v>cc[1].v : hc[1].s>cc[1].s;
+  if (ct==='triple'||ct==='quad') return hc[0].v>cc[0].v;
+  return false;
+}
+function rtOf(h) { return h && FT.has(h.type) ? 'five' : h?.type||null; }
+function okPlay(sel,cur,rt,must) {
+  const h=detect(sel); if (!h) return false;
+  if (must && !sel.some(c=>sk(c)===sk(must))) return false;
+  if (!cur) {
+    if (rt) {const hrt=FT.has(h.type)?'five':h.type; if(hrt!==rt)return false;}
+    return true;
+  }
+  const hrt=FT.has(h.type)?'five':h.type;
+  if (rt&&hrt!==rt) return false;
+  return beats(cur,h);
+}
+function nextTurn(from, passed) {
+  // passed is an array of booleans; find next non-passed player
+  const n = passed.length;
+  let x = (from+1) % n;
+  for (let i=0; i<n; i++) { if (!passed[x]) return x; x=(x+1)%n; }
+  return from;
+}
+function dealGame(n) {
+  const deck=mkDeck();
+  const hands=Array.from({length:n},(_,i)=>srt(deck.slice(i*13,i*13+13)));
+  let sp=0, sc=null, lr=Infinity;
+  for (let p=0;p<n;p++) for (const c of hands[p]) if (cr(c)<lr) {lr=cr(c);sp=p;sc=c;}
+  return {hands, startSeat:sp, startCard:sc};
+}
+
+// ── UI Components ─────────────────────────────────────────────────────────────
+function Card({c, sel, must, faded, insertBefore, sm, onClick, disabled}) {
+  const w=sm?36:50, h=sm?52:72;
+  return (
+    <div onClick={disabled?undefined:onClick}
+      style={{position:'relative',display:'inline-block',flexShrink:0,lineHeight:0}}>
+      {insertBefore && <div style={{position:'absolute',left:-5,top:0,bottom:0,width:3,
+        background:'#60a5fa',borderRadius:2,zIndex:5,pointerEvents:'none'}}/>}
+      <div style={{width:w,height:h,background:sel?'#fef9c3':'#fff',color:SC[c.s],borderRadius:6,
+        border:`2px solid ${must?'#f59e0b':sel?'#b45309':'#d1d5db'}`,
+        cursor:disabled?'default':'pointer',
+        display:'flex',flexDirection:'column',justifyContent:'space-between',padding:3,
+        transform:sel?'translateY(-10px)':'none',transition:'transform .12s',opacity:faded?.3:1,
+        boxShadow:sel?'0 4px 14px rgba(0,0,0,.35)':'0 1px 3px rgba(0,0,0,.2)',
+        fontSize:sm?11:14,fontWeight:'bold',userSelect:'none'}}>
+        <div style={{lineHeight:1}}>{VL[c.v]}</div>
+        <div style={{textAlign:'center',fontSize:sm?13:17,lineHeight:1}}>{SS[c.s]}</div>
+      </div>
+    </div>
+  );
+}
+function Btn({label,on,col,fn,sm,full}) {
+  return (
+    <button onClick={on?fn:undefined} disabled={!on}
+      style={{padding:sm?'6px 10px':'10px 22px',fontSize:sm?11:14,fontWeight:600,
+        background:on?col:'rgba(0,0,0,.3)',color:on?'#fff':'rgba(255,255,255,.3)',
+        borderRadius:8,width:full?'100%':undefined,border:'none',
+        transition:'background .15s'}}>
+      {label}
+    </button>
+  );
+}
+function TxtInput({value,onChange,placeholder,onEnter,big,max}) {
+  return (
+    <input value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder}
+      maxLength={max} onKeyDown={e=>e.key==='Enter'&&onEnter?.()}
+      style={{padding:'10px 14px',fontSize:big?28:15,fontWeight:big?700:400,
+        letterSpacing:big?10:0,borderRadius:10,border:'2px solid rgba(255,255,255,.2)',
+        background:'rgba(0,0,0,.3)',color:'#fff',outline:'none',
+        textAlign:'center',width:'100%'}}/>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App() {
+  const [myId]    = useState(genId);
+  const [screen, setScreen]     = useState('home');
+  const [myName, setMyName]     = useState('');
+  const [joinCode, setJoinCode] = useState('');
+  const [roomCode, setRoomCode] = useState('');
+  const [mySeat, setMySeat]     = useState(0);
+  const [numP, setNumP]         = useState(4);
+  const [players, setPlayers]   = useState({});
+  const [myHand, setMyHand]     = useState([]);
+  const [order, setOrder]       = useState([]);
+  const [gs, setGs]             = useState(null);
+  const [wins, setWins]         = useState({});
+  const [sel, setSel]           = useState(new Set());
+  const [dragSrc, setDragSrc]   = useState(null);
+  const [dragOver, setDragOver] = useState(null);
+  const [err, setErr]           = useState('');
+  const [netErr, setNetErr]     = useState('');
+  const [busy, setBusy]         = useState(false);
+
+  // Refs so polling closure always has fresh values
+  const seatRef   = useRef(0);
+  const codeRef   = useRef('');
+  const screenRef = useRef('home');
+  useEffect(()=>{ seatRef.current = mySeat; },   [mySeat]);
+  useEffect(()=>{ codeRef.current = roomCode; },  [roomCode]);
+  useEffect(()=>{ screenRef.current = screen; },  [screen]);
+
+  // ── Polling ──
+  useEffect(()=>{
+    if (screen!=='lobby' && screen!=='game') return;
+    const poll = async () => {
+      const code = codeRef.current;
+      const seat = seatRef.current;
+      if (!code) return;
+      try {
+        const room = await fbRead(`/rooms/${code}`);
+        if (!room) { setScreen('home'); setNetErr('Room closed.'); return; }
+        const n = num(room.meta?.numPlayers) || 4;
+        if (room.players)  setPlayers(room.players);
+        if (room.meta?.wins) setWins(room.meta.wins);
+
+        if (screenRef.current==='lobby' && room.meta?.status==='playing') {
+          const rawHand = room.hands?.[seat];
+          const hand = srt(toArr(rawHand).map(normCard));
+          setMyHand(hand);
+          setOrder(hand.map(sk));
+          setGs(normState(room.state, n));
+          setSel(new Set());
+          setScreen('game');
+        } else if (screenRef.current==='game' && room.state) {
+          const n2 = num(room.meta?.numPlayers) || 4;
+          setGs(normState(room.state, n2));
+          const rawHand = room.hands?.[seat];
+          if (rawHand) {
+            const newHand = srt(toArr(rawHand).map(normCard));
+            // Only update order when cards have actually been removed
+            setMyHand(prev => {
+              const prevKeys = prev.map(sk).join(',');
+              const newKeys  = newHand.map(sk).join(',');
+              if (prevKeys === newKeys) return prev; // no change
+              setOrder(o => {
+                const hk    = new Set(newHand.map(sk));
+                const kept  = o.filter(k => hk.has(k));
+                const added = newHand.filter(c => !kept.includes(sk(c))).map(sk);
+                return [...kept, ...added];
+              });
+              return newHand;
+            });
+          }
+        }
+        setNetErr('');
+      } catch(e) { setNetErr('Connection issue…'); }
+    };
+    poll();
+    const id = setInterval(poll, 1500);
+    return () => clearInterval(id);
+  }, [screen]);
+
+  // ── Room actions ──
+  async function createRoom() {
+    if (!myName.trim()) { setErr('Enter your name'); return; }
+    setBusy(true); setErr('');
+    try {
+      let code, exists;
+      do { code=genCode(); exists=await fbRead(`/rooms/${code}`); } while (exists);
+      await fbSet(`/rooms/${code}`, {
+        meta: {numPlayers:numP, status:'lobby', wins:{}},
+        players: {'0': {name:myName.trim(), id:myId}},
+        hands: {}, state: null,
+      });
+      setRoomCode(code); setMySeat(0); setScreen('lobby');
+    } catch(e) { setErr('Failed: '+e.message); }
+    finally { setBusy(false); }
+  }
+
+  async function joinRoom() {
+    if (!myName.trim()) { setErr('Enter your name'); return; }
+    const code = joinCode.trim().toUpperCase();
+    if (!code) { setErr('Enter a room code'); return; }
+    setBusy(true); setErr('');
+    try {
+      const room = await fbRead(`/rooms/${code}`);
+      if (!room)                          { setErr('Room not found'); return; }
+      if (room.meta?.status !== 'lobby')  { setErr('Game already started'); return; }
+      const taken = Object.keys(room.players||{}).map(Number);
+      const max   = num(room.meta?.numPlayers)||4;
+      if (taken.length >= max)            { setErr('Room is full'); return; }
+      let seat = 0; while (taken.includes(seat)) seat++;
+      await fbSet(`/rooms/${code}/players/${seat}`, {name:myName.trim(), id:myId});
+      setRoomCode(code); setMySeat(seat); setNumP(max); setScreen('lobby');
+    } catch(e) { setErr('Failed: '+e.message); }
+    finally { setBusy(false); }
+  }
+
+  async function startGame() {
+    if (mySeat !== 0) return;
+    const n = Object.keys(players).length;
+    if (n < 2) { setErr('Need at least 2 players'); return; }
+    setBusy(true); setErr('');
+    try {
+      const {hands, startSeat, startCard} = dealGame(n);
+      // Store each hand as a plain object {0:card, 1:card, ...}
+      const handData = {};
+      for (let i=0; i<n; i++)
+        handData[i] = hands[i].reduce((a,c,j)=>{ a[j]=c; return a; }, {});
+      const state = {
+        cur: null, rt: 'single',
+        turn: startSeat,
+        passed: Array(n).fill(false),
+        must: startCard,
+        lastBy: startSeat,
+        winner: null,
+        roundNum: 0,
+        handSizes: Array(n).fill(13),
+        log: [`${pName(startSeat)} goes first (${cStr(startCard)})`],
+      };
+      await fbSet(`/rooms/${roomCode}/hands`, handData);
+      await fbSet(`/rooms/${roomCode}/state`, state);
+      await fbPatch(`/rooms/${roomCode}/meta`, {status:'playing', numPlayers:n});
+    } catch(e) { setErr('Start failed: '+e.message); }
+    finally { setBusy(false); }
+  }
+
+  // ── Game actions ──
+  async function submitPlay(cards) {
+    if (!gs || num(gs.turn) !== mySeat || busy) return;
+    if (!okPlay(cards, gs.cur, gs.rt, gs.must)) { setErr('Invalid play — try again'); return; }
+    const h = detect(cards);
+    const n = gs.handSizes.length;
+    const newHand = srt(myHand.filter(c=>!cards.some(p=>sk(p)===sk(c))));
+    const passed  = [...gs.passed];
+    const sizes   = [...gs.handSizes]; sizes[mySeat] = newHand.length;
+    const winner  = newHand.length === 0 ? mySeat : null;
+    const newState = {
+      cur:     {type:h.type, cards},
+      rt:      gs.rt || rtOf(h),
+      turn:    winner != null ? mySeat : nextTurn(mySeat, passed),
+      passed,
+      must:    null,
+      lastBy:  mySeat,
+      winner:  winner != null ? mySeat : null,
+      roundNum: gs.roundNum,
+      handSizes: sizes,
+      log: [...gs.log.slice(-19), `${pName(mySeat)}: ${cards.map(cStr).join(' ')} (${h.type})`],
+    };
+    setBusy(true);
+    try {
+      await fbSet(`/rooms/${roomCode}/state`, newState);
+      await fbSet(`/rooms/${roomCode}/hands/${mySeat}`,
+        newHand.reduce((a,c,i)=>{ a[i]=c; return a; }, {}));
+      if (winner != null) {
+        const nw = {...wins, [mySeat]: (num(wins[mySeat])||0)+1};
+        await fbSet(`/rooms/${roomCode}/meta/wins`, nw);
+        setWins(nw);
+      }
+      setMyHand(newHand);
+      setOrder(p=>{ const hk=new Set(newHand.map(sk)); return p.filter(k=>hk.has(k)); });
+      setGs(normState(newState, n));
+      setSel(new Set()); setErr('');
+    } catch { setErr('Play failed — try again'); }
+    finally { setBusy(false); }
+  }
+
+  async function submitPass() {
+    if (!gs || num(gs.turn) !== mySeat || !gs.cur || busy) return;
+    const n = gs.handSizes.length;
+    const passed = [...gs.passed]; passed[mySeat] = true;
+    const foldCount = passed.filter(Boolean).length;
+    let newState;
+    if (foldCount >= n-1) {
+      // Everyone else folded — find the winner
+      const rw = passed.findIndex(p=>!p);
+      if (rw === -1) { setErr('Round error'); return; }
+      newState = {...gs, cur:null, rt:null, turn:rw,
+        passed: Array(n).fill(false), must:null, lastBy:rw,
+        roundNum: gs.roundNum+1,
+        log: [...gs.log.slice(-18),
+          `${pName(mySeat)} folds`,
+          `${pName(rw)} wins the round`]};
+    } else {
+      newState = {...gs,
+        turn: nextTurn(mySeat, passed),
+        passed,
+        log: [...gs.log.slice(-19), `${pName(mySeat)} folds`]};
+    }
+    setBusy(true);
+    try {
+      await fbSet(`/rooms/${roomCode}/state`, newState);
+      setGs(normState(newState, n));
+      setSel(new Set()); setErr('');
+    } catch { setErr('Pass failed — try again'); }
+    finally { setBusy(false); }
+  }
+
+  function reorder(from, at) {
+    setOrder(p => {
+      const n=[...p], [m]=n.splice(from,1);
+      n.splice(at>from?at-1:at, 0, m);
+      return n;
+    });
+  }
+  function toggleCard(c) {
+    if (num(gs?.turn) !== mySeat) return;
+    const k = sk(c);
+    setSel(s => { const n=new Set(s); n.has(k)?n.delete(k):n.add(k); return n; });
+    setErr('');
+  }
+  function leaveRoom() {
+    setScreen('home'); setRoomCode(''); setMySeat(0);
+    setPlayers({}); setGs(null); setMyHand([]); setWins({});
+    setErr(''); setNetErr('');
+  }
+
+  // Safe player name lookup (Firebase keys are strings)
+  function pName(s) {
+    return players[String(s)]?.name || players[s]?.name || `Player ${num(s)+1}`;
+  }
+
+  const displayHand = order.map(k=>myHand.find(c=>sk(c)===k)).filter(Boolean);
+  const selC   = myHand.filter(c=>sel.has(sk(c)));
+  const detH   = detect(selC);
+  const myTurn = gs != null && num(gs.turn) === mySeat && gs.winner == null;
+  const canPlay  = !!detH && myTurn && !busy && okPlay(selC, gs?.cur, gs?.rt, gs?.must);
+  const canPass  = myTurn && !busy && !gs?.must && !!gs?.cur;
+  const leadFresh= myTurn && !gs?.cur && !gs?.must;
+  const n = gs?.handSizes?.length || numP;
+
+  // ── Screens ───────────────────────────────────────────────────────────────
+
+  // HOME
+  if (screen === 'home') return (
+    <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',
+      minHeight:'100vh',gap:16,padding:20}}>
+      <div style={{fontSize:40,fontWeight:800,letterSpacing:8}}>BIG 2</div>
+      <div style={{fontSize:12,opacity:.4,marginTop:-12,letterSpacing:3,textTransform:'uppercase'}}>Online Multiplayer</div>
+      <div style={{width:300,marginTop:8}}>
+        <TxtInput value={myName} onChange={setMyName} placeholder="Your name" max={14} onEnter={createRoom}/>
+      </div>
+      <div style={{background:DG,borderRadius:16,padding:20,width:300}}>
+        <div style={{fontSize:11,opacity:.5,marginBottom:12,textAlign:'center',textTransform:'uppercase',letterSpacing:1}}>Create Room</div>
+        <div style={{display:'flex',gap:8,marginBottom:14}}>
+          {[2,3,4].map(np=>(
+            <button key={np} onClick={()=>setNumP(np)} style={{flex:1,padding:'10px 0',borderRadius:8,
+              border:`2px solid ${numP===np?GOLD:'rgba(255,255,255,.15)'}`,
+              background:numP===np?'rgba(251,191,36,.15)':'rgba(0,0,0,.25)',
+              color:'#fff',fontSize:16,fontWeight:700}}>
+              {np}P
+            </button>
+          ))}
+        </div>
+        <Btn label={busy?'…':'Create Room'} on={!busy} col="#15803d" fn={createRoom} full/>
+      </div>
+      <div style={{background:DG,borderRadius:16,padding:20,width:300}}>
+        <div style={{fontSize:11,opacity:.5,marginBottom:12,textAlign:'center',textTransform:'uppercase',letterSpacing:1}}>Join Room</div>
+        <div style={{marginBottom:14}}>
+          <TxtInput value={joinCode} onChange={v=>setJoinCode(v.toUpperCase())}
+            placeholder="ROOM CODE" max={4} big onEnter={joinRoom}/>
+        </div>
+        <Btn label={busy?'…':'Join Room'} on={!busy} col="#0e7490" fn={joinRoom} full/>
+      </div>
+      {err && <div style={{color:'#f87171',fontSize:13,textAlign:'center',maxWidth:300}}>{err}</div>}
+      <div style={{fontSize:11,opacity:.25,textAlign:'center',maxWidth:260,lineHeight:1.8,marginTop:4}}>
+        Host creates a room · share the 4-letter code<br/>Everyone opens this page and joins with the code
+      </div>
+    </div>
+  );
+
+  // LOBBY
+  if (screen === 'lobby') {
+    const pl = Object.entries(players).sort((a,b)=>+a[0]-+b[0]);
+    const isHost = mySeat === 0;
+    return (
+      <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:16,padding:20,paddingTop:60}}>
+        <div style={{fontSize:26,fontWeight:700,letterSpacing:5}}>BIG 2</div>
+        <div style={{background:DG,borderRadius:16,padding:'18px 30px',textAlign:'center',width:300}}>
+          <div style={{fontSize:11,opacity:.5,marginBottom:10,textTransform:'uppercase',letterSpacing:1}}>Share this code</div>
+          <div style={{fontSize:56,fontWeight:800,letterSpacing:12,color:GOLD,lineHeight:1}}>{roomCode}</div>
+        </div>
+        <div style={{background:DG,borderRadius:16,padding:16,width:300}}>
+          <div style={{fontSize:11,opacity:.5,marginBottom:10,textTransform:'uppercase',letterSpacing:1}}>
+            Players ({pl.length}/{numP})
+          </div>
+          {Array.from({length:numP},(_,s)=>{
+            const p = players[String(s)];
+            return (
+              <div key={s} style={{display:'flex',alignItems:'center',gap:10,padding:'9px 0',
+                borderBottom:s<numP-1?'1px solid rgba(255,255,255,.08)':'none'}}>
+                <div style={{width:9,height:9,borderRadius:'50%',flexShrink:0,
+                  background:p?'#86efac':'rgba(255,255,255,.12)'}}/>
+                {p
+                  ? <span style={{fontSize:14}}><b>{p.name}</b>
+                      <span style={{opacity:.4,fontSize:12}}>
+                        {p.id===myId?' (you)':''}{s===0?' 👑':''}
+                      </span>
+                    </span>
+                  : <span style={{fontSize:12,opacity:.3}}>Waiting…</span>}
+              </div>
+            );
+          })}
+        </div>
+        {isHost
+          ? <Btn label={pl.length>=2&&!busy?'Start Game →':'Waiting for players…'}
+              on={pl.length>=2&&!busy} col="#15803d" fn={startGame}/>
+          : <div style={{fontSize:13,opacity:.5}}>Waiting for host to start…</div>}
+        <Btn label="← Leave" on col="#6b21a8" fn={leaveRoom} sm/>
+        {err    && <div style={{color:'#f87171',fontSize:13}}>{err}</div>}
+        {netErr && <div style={{color:GOLD,fontSize:12,opacity:.8}}>{netErr}</div>}
+      </div>
+    );
+  }
+
+  // GAME
+  if (screen === 'game' && gs) {
+    const others = [...Array(n).keys()].filter(s=>s!==mySeat);
+    const isFolded = gs.passed[mySeat] && !myTurn;
+    const statusMsg = gs.winner != null ? ''
+      : isFolded ? 'You folded — waiting for the round to end'
+      : myTurn
+        ? gs.must ? `Must include ${cStr(gs.must)} — singles only`
+          : leadFresh ? 'You lead — choose any hand type'
+          : 'Your turn'
+      : `Waiting for ${pName(gs.turn)}…`;
+
+    return (
+      <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:10,
+        padding:12,paddingBottom:24,userSelect:'none'}}>
+
+        <div style={{display:'flex',alignItems:'center',gap:8,marginTop:4}}>
+          <span style={{fontSize:22,fontWeight:700,letterSpacing:4}}>BIG 2</span>
+          <span style={{fontSize:11,opacity:.3}}>#{roomCode}</span>
+        </div>
+
+        {/* Scoreboard */}
+        <div style={{background:DG,borderRadius:10,padding:'8px 12px',width:'100%',maxWidth:460}}>
+          <div style={{display:'grid',gridTemplateColumns:`repeat(${n},1fr)`,gap:4}}>
+            {[...Array(n).keys()].map(s=>(
+              <div key={s} style={{textAlign:'center',background:'rgba(0,0,0,.15)',borderRadius:8,padding:'5px 4px',
+                border: gs.winner===s ? `1px solid ${GOLD}`
+                  : gs.turn===s&&gs.winner==null ? '1px solid rgba(255,215,0,.3)'
+                  : '1px solid transparent'}}>
+                <div style={{fontSize:11,opacity:.65,overflow:'hidden',textOverflow:'ellipsis',
+                  whiteSpace:'nowrap',marginBottom:1}}>
+                  {pName(s)}{s===mySeat?' 🧑':''}
+                </div>
+                <div style={{fontSize:20,fontWeight:700,color:'#86efac'}}>{num(wins[s])||0}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Other players */}
+        <div style={{display:'flex',gap:8,flexWrap:'wrap',justifyContent:'center'}}>
+          {others.map(s=>{
+            const folded = gs.passed[s];
+            const active = gs.turn===s && gs.winner==null;
+            return (
+              <div key={s} style={{background:DG,borderRadius:10,padding:'8px 12px',textAlign:'center',minWidth:84,
+                border:`2px solid ${active?GOLD:folded?'rgba(255,80,80,.35)':'transparent'}`,
+                opacity:folded?.6:1}}>
+                <div style={{fontSize:13,fontWeight:600,marginBottom:2}}>{pName(s)}</div>
+                <div style={{fontSize:13}}>🂠×{gs.handSizes?.[s]??13}</div>
+                {folded && <div style={{fontSize:10,color:'#f87171',marginTop:2}}>folded</div>}
+                {active  && <div style={{fontSize:10,color:GOLD,marginTop:2}}>thinking…</div>}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Pile */}
+        <div style={{background:DG,borderRadius:12,padding:'12px 20px',width:'100%',maxWidth:460,
+          minHeight:88,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:6}}>
+          {gs.cur ? (
+            <>
+              <div style={{fontSize:11,opacity:.6,textTransform:'uppercase',letterSpacing:1}}>
+                {gs.cur.type} · {gs.rt} round
+              </div>
+              <div style={{display:'flex',gap:5,justifyContent:'center',flexWrap:'wrap'}}>
+                {gs.cur.cards.map(c=><Card key={sk(c)} c={c} sm/>)}
+              </div>
+            </>
+          ) : (
+            <div style={{opacity:.5,fontSize:13,textAlign:'center',lineHeight:1.9}}>
+              {gs.must
+                ? <span>First play — <b>singles only</b>. Must include {cStr(gs.must)}</span>
+                : <span>Lead with <b>any hand type</b><br/>
+                    <span style={{fontSize:11,opacity:.7}}>single · pair · triple · quad · five-card</span>
+                  </span>}
+              {leadFresh && detH && (
+                <div style={{marginTop:6,fontSize:12,fontWeight:600,color:canPlay?'#86efac':'#f87171'}}>
+                  {detH.type} {canPlay?'✓ ready':'✗ invalid'}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Status */}
+        <div style={{fontSize:13,textAlign:'center',minHeight:18,
+          color: gs.winner!=null ? GOLD : myTurn ? '#bbf7d0' : 'rgba(255,255,255,.6)'}}>
+          {gs.winner != null
+            ? (gs.winner===mySeat ? '🎉 You win!' : `🏆 ${pName(gs.winner)} wins!`)
+            : statusMsg}
+          {detH && myTurn && !leadFresh && (
+            <span style={{marginLeft:8,fontWeight:700,color:canPlay?'#86efac':'#f87171'}}>
+              {detH.type} {canPlay?'✓':'✗'}
+            </span>
+          )}
+        </div>
+
+        {/* Hand */}
+        <div style={{display:'flex',gap:4,justifyContent:'center',flexWrap:'wrap',
+          maxWidth:560,padding:'0 4px 12px',alignItems:'flex-end'}}>
+          {displayHand.map((c,i)=>{
+            const k = sk(c);
+            return (
+              <div key={k} draggable
+                onDragStart={e=>{e.dataTransfer.setData('text/plain',String(i));
+                  e.dataTransfer.effectAllowed='move';setTimeout(()=>setDragSrc(i),0);}}
+                onDragEnd={()=>{setDragSrc(null);setDragOver(null);}}
+                onDragOver={e=>{e.preventDefault();if(dragOver!==i)setDragOver(i);}}
+                onDrop={e=>{e.preventDefault();
+                  const f=parseInt(e.dataTransfer.getData('text/plain'),10);
+                  reorder(f,i);setDragSrc(null);setDragOver(null);}}>
+                <Card c={c} sel={sel.has(k)} must={!!gs.must&&k===sk(gs.must)}
+                  faded={dragSrc===i} insertBefore={dragOver===i&&dragSrc!==i}
+                  disabled={!myTurn} onClick={()=>toggleCard(c)}/>
+              </div>
+            );
+          })}
+          <div style={{width:16,alignSelf:'stretch',borderRadius:4,flexShrink:0,
+            background:dragOver===displayHand.length?'rgba(96,165,250,.35)':'transparent'}}
+            onDragOver={e=>{e.preventDefault();if(dragOver!==displayHand.length)setDragOver(displayHand.length);}}
+            onDrop={e=>{e.preventDefault();
+              const f=parseInt(e.dataTransfer.getData('text/plain'),10);
+              reorder(f,displayHand.length);setDragSrc(null);setDragOver(null);}}/>
+        </div>
+
+        <div style={{fontSize:11,opacity:.35,marginTop:-10,marginBottom:2}}>drag to reorder · click to select</div>
+
+        {gs.winner != null ? (
+          <div style={{display:'flex',gap:8,flexWrap:'wrap',justifyContent:'center'}}>
+            {mySeat===0 && <Btn label="▶ Deal Again" on={!busy} col="#15803d" fn={startGame}/>}
+            <Btn label="🏠 Leave" on col="#6b21a8" fn={leaveRoom}/>
+          </div>
+        ) : (
+          <div style={{display:'flex',gap:8}}>
+            <Btn label={busy?'…':'▶ Play'} on={canPlay} col="#15803d" fn={()=>submitPlay(selC)}/>
+            <Btn label={busy?'…':'↩ Pass'} on={canPass} col="#4b5563" fn={submitPass}/>
+          </div>
+        )}
+
+        {err    && <div style={{color:'#f87171',fontSize:12,textAlign:'center',maxWidth:400}}>{err}</div>}
+        {netErr && <div style={{color:GOLD,fontSize:11,textAlign:'center'}}>{netErr}</div>}
+
+        {/* Log */}
+        <div style={{background:'rgba(0,0,0,.15)',borderRadius:8,padding:'7px 10px',
+          width:'100%',maxWidth:460,maxHeight:80,overflowY:'auto',fontSize:12,opacity:.7,lineHeight:1.7}}>
+          {gs.log.slice(-8).map((l,i)=><div key={i}>{l}</div>)}
+        </div>
+
+        <div style={{fontSize:11,opacity:.35,textAlign:'center',lineHeight:1.9,paddingBottom:4}}>
+          <div>
+            <span style={{color:'#dc2626'}}>♦</span> &lt; <span style={{color:'#111827',WebkitTextStroke:'0.3px #aaa'}}>♣</span> &lt; <span style={{color:'#dc2626'}}>♥</span> &lt; <span style={{color:'#111827',WebkitTextStroke:'0.3px #aaa'}}>♠</span>
+            <span style={{opacity:.6}}> · suits lowest to highest</span>
+          </div>
+          <div>Straight &lt; Flush &lt; Full House &lt; Straight Flush &lt; Royal Flush</div>
+        </div>
+      </div>
+    );
+  }
+
+  return <div style={{display:'flex',alignItems:'center',justifyContent:'center',
+    height:'100vh',fontSize:16}}>Loading…</div>;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
